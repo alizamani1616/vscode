@@ -21,6 +21,10 @@ import { buildAnnotationsUri, isAnnotationsUri, parseAnnotationsUri } from '../c
 import { AgentHostChangesetStateCache, type IAgentHostChangesetStateRetentionOptions } from './agentHostChangesetStateCache.js';
 import { ChangesSummary, ChatInteractivity, type ChatOrigin, type SessionChatSummary } from '../common/state/protocol/state.js';
 import { arrayEquals, structuralEquals } from '../../../base/common/equals.js';
+import { canvasReducer } from '../common/state/protocol/channels-canvas/reducer.js';
+import type { CanvasState } from '../common/state/protocol/channels-canvas/state.js';
+import { parseCanvasChatUri } from '../common/canvasUri.js';
+import { URI as ResourceURI } from '../../../base/common/uri.js';
 import { preserveProviderBackedRootConfigValues } from '../common/agentCustomizationSettings.js';
 import type { IAgentHostClientTelemetryContext } from '../common/agentHostTelemetry.js';
 import { readEphemeralSessionMeta } from '../common/meta/agentEphemeralSessionMeta.js';
@@ -271,6 +275,7 @@ export class AgentHostStateManager extends Disposable {
 	private readonly _annotations = new Map<string, AnnotationsState>();
 	private _automationCatalog: AutomationState | undefined;
 	private readonly _automationRuns = new Map<string, AutomationRunState>();
+	private readonly _canvases = new Map<string, { readonly chat: string; state: CanvasState }>();
 
 	/**
 	 * Active turns per session, keyed by session URI string with the value
@@ -769,6 +774,10 @@ export class AgentHostStateManager extends Disposable {
 				fromSeq: this._serverSeq,
 			};
 		}
+		const canvas = this._canvases.get(resource);
+		if (canvas) {
+			return { resource, state: canvas.state, fromSeq: this._serverSeq };
+		}
 
 		// Changeset URIs are nested under their session URI; check them
 		// before falling back to the session map so a session whose URI
@@ -834,6 +843,32 @@ export class AgentHostStateManager extends Disposable {
 
 	getAutomationRunState(resource: string): AutomationRunState | undefined {
 		return this._automationRuns.get(resource);
+	}
+
+	/** Installs canvas state before its chat advertises the channel reference. */
+	setCanvasState(chat: string, resource: string, state: CanvasState): void {
+		const owner = this._chatEntries.get(chat);
+		if (!owner?.valid || !owner.state) {
+			this._logService.warn(`[AgentHostStateManager] Canvas state for unavailable chat: ${chat}`);
+			return;
+		}
+		if (parseCanvasChatUri(ResourceURI.parse(resource))?.toString() !== chat) {
+			throw new Error(`Canvas channel does not belong to chat: ${resource}`);
+		}
+		const previous = this._canvases.get(resource);
+		if (previous?.state === state) {
+			return;
+		}
+		this._canvases.set(resource, { chat, state });
+		this.dispatchServerAction(resource, { type: ActionType.CanvasStateChanged, canvas: state });
+	}
+
+	private _pruneChatCanvases(chat: string, resources: ReadonlySet<string>): void {
+		for (const [resource, canvas] of this._canvases) {
+			if (canvas.chat === chat && !resources.has(resource)) {
+				this._canvases.delete(resource);
+			}
+		}
 	}
 
 	/** Read-only accessor for callers that only need to inspect a changeset (not subscribe). */
@@ -1829,6 +1864,7 @@ export class AgentHostStateManager extends Disposable {
 	// ---- Internal -----------------------------------------------------------
 
 	private _invalidateChatEntry(chat: URI): void {
+		this._pruneChatCanvases(chat, new Set());
 		const entry = this._chatEntries.get(chat);
 		if (entry) {
 			entry.valid = false;
@@ -1944,11 +1980,24 @@ export class AgentHostStateManager extends Disposable {
 			if (chat && chatEntry && sessionKey !== undefined) {
 				const newChat = chatReducer(chat, chatAction, this._log);
 				chatEntry.state = newChat;
+				if (chatAction.type === ActionType.ChatCanvasesChanged) {
+					this._pruneChatCanvases(channel, new Set(newChat.canvases?.map(canvas => canvas.resource) ?? []));
+				}
 				this._onChatStateChanged(sessionKey, channel, chat, newChat);
 				resultingState = newChat;
 			} else {
 				this._logService.warn(`[AgentHostStateManager] Action for unknown chat: ${channel}, type=${action.type}`);
 			}
+		}
+
+		if (action.type === ActionType.CanvasStateChanged) {
+			const canvas = this._canvases.get(channel);
+			if (!canvas) {
+				this._logService.warn(`[AgentHostStateManager] Action for unknown canvas: ${channel}`);
+				return undefined;
+			}
+			canvas.state = canvasReducer(canvas.state, action, this._log);
+			resultingState = canvas.state;
 		}
 
 		if (isChangesetAction(action)) {
